@@ -1,6 +1,12 @@
-// 发送请求的worker
+import { readChatCompletionStream } from './chatStream';
+
+// worker 负责 HTTP 请求与消息通知；SSE 的字节、行和事件解析交给 chatStream。
 self.onmessage = async (event) => {
   const { taskId, messages, userApiKey, model, API_URL } = event.data;
+  // taskId 把回复关联到原任务；isComplete 告知线程池是否可以回收 worker。
+  // 默认发送结束通知；流式更新显式传 false，避免错误分支遗漏任务结束状态。
+  const send = (result: string, isComplete = true) =>
+    self.postMessage({ taskId, isComplete, result });
   const requestData = {
     model,
     messages,
@@ -15,55 +21,19 @@ self.onmessage = async (event) => {
       },
       body: JSON.stringify(requestData),
     });
-    if (response.status === 401) {
-      self.postMessage({ taskId, isComplete: true, result: '认证失败，请检查 API Key 是否正确' });
-      return;
-    } else if (!response.ok) {
-      self.postMessage({ taskId, isComplete: true, result: `请求失败，错误码: ${response.status}` });
-      return;
-    }
-    if (!response.body) {
-      self.postMessage({ taskId, isComplete: true, result: '服务器未返回流数据' });
-      return;
-    }
+    if (response.status === 401) return send('认证失败，请检查 API Key 是否正确');
+    if (!response.ok) return send(`请求失败，错误码: ${response.status}`);
+    if (!response.body) return send('服务器未返回流数据');
 
-    // 读取流式响应数据（sse）
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let currentText = '';  //存结果
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n').filter(line => line.trim() !== '');
-      // 流式响应数据：
-      // {"id":"****","choices":[{"delta":{"content":"我是","function_call":null,"refusal":null,"role":null,"tool_calls":null},
-      // "finish_reason":null,"index":0,"logprobs":null}],"created":1735113344,
-      // "model":"qwen-plus","object":"chat.completion.chunk","service_tier":null,
-      // "system_fingerprint":null,"usage":null}
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const jsonLine = line.slice(6).trim();  // 移除 `data: ` 前缀
-          if (jsonLine === '[DONE]') {
-            // 响应：data: [DONE] ，则结束
-            self.postMessage({ taskId, isComplete: true, result: currentText });
-            return;
-          }
-          try {
-            const parsedLine = JSON.parse(jsonLine);
-            const deltaContent = parsedLine?.choices?.[0]?.delta?.content;
-            if (deltaContent) {
-              currentText += deltaContent;
-              self.postMessage({ taskId, isComplete: false, result: currentText });
-            }
-          } catch (err) {
-            self.postMessage({ taskId, result: '解析流数据时出错，请稍后重试' });
-          }
-        }
-      }
-    }
+    // onContent 回调收到累计全文后，发出未完成通知，让页面持续更新回复。
+    // await 的返回值只在整个解析过程结束后得到，再发送一次完成通知。
+    const currentText = await readChatCompletionStream(response.body, (result) => send(result, false));
+    send(currentText);
   } catch (error) {
-    self.postMessage({ taskId, result: '请求失败，请稍后重试' });
+    // 解析失败和请求失败保留不同提示；两种情况都结束任务，避免一直处于生成中。
+    const result = error instanceof SyntaxError
+      ? '解析流数据时出错，请稍后重试'
+      : '请求失败，请稍后重试';
+    send(result);
   }
 };
